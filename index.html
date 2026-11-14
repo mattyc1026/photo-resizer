@@ -465,30 +465,163 @@
   }
 
   // ---------- resizing ----------
+  // Lanczos3 resampler, run in a background worker so the page stays responsive
+  function lanczosWorkerMain() {
+    const A = 3;
+    function kernel(x) {
+      if (x === 0) return 1;
+      if (x <= -A || x >= A) return 0;
+      const px = Math.PI * x;
+      return (A * Math.sin(px) * Math.sin(px / A)) / (px * px);
+    }
+    function weights(srcSize, dstSize) {
+      const scale = dstSize / srcSize;
+      const fs = Math.min(1, scale);
+      const support = A / fs;
+      const starts = new Int32Array(dstSize), counts = new Int32Array(dstSize);
+      const list = [];
+      for (let i = 0; i < dstSize; i++) {
+        const center = (i + 0.5) / scale;
+        const lo = Math.max(0, Math.floor(center - support));
+        const hi = Math.min(srcSize - 1, Math.ceil(center + support));
+        let sum = 0;
+        const w = [];
+        for (let j = lo; j <= hi; j++) { const v = kernel((j + 0.5 - center) * fs); w.push(v); sum += v; }
+        starts[i] = lo; counts[i] = w.length;
+        for (let k = 0; k < w.length; k++) list.push(sum ? w[k] / sum : 0);
+      }
+      return { starts, counts, w: Float32Array.from(list) };
+    }
+    self.onmessage = (e) => {
+      const { src, sw, sh, dw, dh } = e.data;
+      const s = new Uint8ClampedArray(src);
+      // horizontal pass: premultiplied, stored as Uint16 with headroom for ringing
+      const hx = weights(sw, dw);
+      const tmp = new Uint16Array(dw * sh * 4);
+      for (let y = 0; y < sh; y++) {
+        const row = y * sw * 4;
+        let wi = 0;
+        for (let x = 0; x < dw; x++) {
+          const st = hx.starts[x], cnt = hx.counts[x];
+          let r = 0, g = 0, b = 0, a = 0;
+          for (let k = 0; k < cnt; k++) {
+            const p = row + (st + k) * 4;
+            const al = s[p + 3];
+            const wa = hx.w[wi + k];
+            const wp = wa * al / 255;
+            r += s[p] * wp; g += s[p + 1] * wp; b += s[p + 2] * wp; a += al * wa;
+          }
+          wi += cnt;
+          const o = (y * dw + x) * 4;
+          tmp[o] = Math.max(0, Math.min(65535, (r + 64) * 128));
+          tmp[o + 1] = Math.max(0, Math.min(65535, (g + 64) * 128));
+          tmp[o + 2] = Math.max(0, Math.min(65535, (b + 64) * 128));
+          tmp[o + 3] = Math.max(0, Math.min(65535, (a + 64) * 128));
+        }
+      }
+      // vertical pass
+      const vy = weights(sh, dh);
+      const out = new Uint8ClampedArray(dw * dh * 4);
+      let wi = 0;
+      for (let y = 0; y < dh; y++) {
+        const st = vy.starts[y], cnt = vy.counts[y];
+        for (let x = 0; x < dw; x++) {
+          let r = 0, g = 0, b = 0, a = 0;
+          for (let k = 0; k < cnt; k++) {
+            const p = ((st + k) * dw + x) * 4;
+            const wv = vy.w[wi + k];
+            r += (tmp[p] / 128 - 64) * wv; g += (tmp[p + 1] / 128 - 64) * wv;
+            b += (tmp[p + 2] / 128 - 64) * wv; a += (tmp[p + 3] / 128 - 64) * wv;
+          }
+          const o = (y * dw + x) * 4;
+          if (a >= 254.5) { out[o] = r; out[o + 1] = g; out[o + 2] = b; out[o + 3] = 255; }
+          else if (a > 0.5) { const m = 255 / a; out[o] = r * m; out[o + 1] = g * m; out[o + 2] = b * m; out[o + 3] = a; }
+          else { out[o + 3] = 0; }
+        }
+        wi += cnt;
+      }
+      self.postMessage({ out: out.buffer }, [out.buffer]);
+    };
+  }
+
+  let worker = null;
+  function lanczos(data, sw, sh, dw, dh) {
+    if (!worker) {
+      const url = URL.createObjectURL(new Blob(['(' + lanczosWorkerMain.toString() + ')()'], { type: 'text/javascript' }));
+      worker = new Worker(url);
+    }
+    return new Promise((resolve, reject) => {
+      worker.onmessage = (e) => resolve(new Uint8ClampedArray(e.data.out));
+      worker.onerror = (e) => { worker.terminate(); worker = null; reject(e); };
+      worker.postMessage({ src: data.buffer, sw, sh, dw, dh }, [data.buffer]);
+    });
+  }
+
+  // Older smoothing method, used for enlarging and as a fallback
+  function smoothResize(img, iw, ih, tw, th) {
+    let src = img, cw = iw, ch = ih;
+    while (cw / 2 >= tw && ch / 2 >= th) {
+      const nw = Math.round(cw / 2), nh = Math.round(ch / 2);
+      const step = canvas(nw, nh);
+      const sctx = step.getContext('2d');
+      sctx.imageSmoothingEnabled = true;
+      sctx.imageSmoothingQuality = 'high';
+      sctx.drawImage(src, 0, 0, nw, nh);
+      if (src !== img) { src.width = src.height = 0; }
+      src = step; cw = nw; ch = nh;
+    }
+    const out = canvas(tw, th);
+    const ctx = out.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+    ctx.imageSmoothingQuality = 'high';
+    ctx.drawImage(src, 0, 0, tw, th);
+    if (src !== img) { src.width = src.height = 0; }
+    return out;
+  }
+
+  async function sharpResize(img, iw, ih, tw, th) {
+    // Keep the source within the browser's canvas limit (very large iPhone photos)
+    let sw = iw, sh = ih;
+    if (sw * sh > MAX_PIXELS) {
+      const f = Math.sqrt(MAX_PIXELS / (sw * sh)) * 0.98;
+      sw = Math.max(tw, Math.floor(sw * f)); sh = Math.max(th, Math.floor(sh * f));
+    }
+    const sc = canvas(sw, sh);
+    const sctx = sc.getContext('2d', { willReadFrequently: true });
+    sctx.imageSmoothingEnabled = true;
+    sctx.imageSmoothingQuality = 'high';
+    sctx.drawImage(img, 0, 0, sw, sh);
+    const data = sctx.getImageData(0, 0, sw, sh).data;
+    sc.width = sc.height = 0;
+    const px = await lanczos(data, sw, sh, tw, th);
+    const out = canvas(tw, th);
+    out.getContext('2d').putImageData(new ImageData(px, tw, th), 0, 0);
+    return out;
+  }
+
   async function resizeOne(it, tw, th, ext, quality) {
     const { img, url } = await imgFromBlob(it.src);
     try {
-      let src = img, cw = img.naturalWidth, ch = img.naturalHeight;
-      // Step down in halves for a sharper result when shrinking a lot
-      while (cw / 2 >= tw && ch / 2 >= th) {
-        const nw = Math.round(cw / 2), nh = Math.round(ch / 2);
-        const step = canvas(nw, nh);
-        const sctx = step.getContext('2d');
-        sctx.imageSmoothingEnabled = true;
-        sctx.imageSmoothingQuality = 'high';
-        sctx.drawImage(src, 0, 0, nw, nh);
-        if (src !== img) { src.width = src.height = 0; }
-        src = step; cw = nw; ch = nh;
+      const iw = img.naturalWidth, ih = img.naturalHeight;
+      let out;
+      if (tw * th <= iw * ih) {
+        try { out = await sharpResize(img, iw, ih, tw, th); }
+        catch (e) { out = smoothResize(img, iw, ih, tw, th); }
+      } else {
+        out = smoothResize(img, iw, ih, tw, th);
       }
-      const out = canvas(tw, th);
-      const ctx = out.getContext('2d');
-      if (MIME[ext] === 'image/jpeg') { ctx.fillStyle = '#ffffff'; ctx.fillRect(0, 0, tw, th); }
-      ctx.imageSmoothingEnabled = true;
-      ctx.imageSmoothingQuality = 'high';
-      ctx.drawImage(src, 0, 0, tw, th);
-      if (src !== img) { src.width = src.height = 0; }
 
       const mime = MIME[ext];
+      if (mime === 'image/jpeg') {
+        const flat = canvas(tw, th);
+        const fctx = flat.getContext('2d');
+        fctx.fillStyle = '#ffffff';
+        fctx.fillRect(0, 0, tw, th);
+        fctx.drawImage(out, 0, 0);
+        out.width = out.height = 0;
+        out = flat;
+      }
+
       const q = quality / 100;
       let blob = await toBlob(out, mime, mime === 'image/png' ? undefined : q);
       if (mime === 'image/webp' && (!blob || blob.type !== 'image/webp')) blob = await webpWasm(out, quality);
